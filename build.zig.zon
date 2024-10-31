@@ -1,0 +1,15 @@
+.{
+    .name = "clickhouse-zig",
+    .version = "0.1.0",
+    .dependencies = .{
+        // No external dependencies yet, as we include LZ4 and ZSTD directly
+    },
+    .paths = .{
+        "src",
+        "examples",
+        "build.zig",
+        "build.zig.zon",
+        "LICENSE",
+        "README.md",
+    },
+}
