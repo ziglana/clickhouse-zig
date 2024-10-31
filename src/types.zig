@@ -26,6 +26,8 @@ pub const ClickHouseType = enum {
     Enum16,
     Map,
     Tuple,
+    LowCardinality,
+    Nested,
     
     pub fn fromStr(type_str: []const u8) !ClickHouseType {
         if (std.mem.eql(u8, type_str, "Int8")) return .Int8;
@@ -55,6 +57,8 @@ pub const ClickHouseType = enum {
         if (std.mem.startsWith(u8, type_str, "Enum16")) return .Enum16;
         if (std.mem.startsWith(u8, type_str, "Map")) return .Map;
         if (std.mem.startsWith(u8, type_str, "Tuple")) return .Tuple;
+        if (std.mem.startsWith(u8, type_str, "LowCardinality")) return .LowCardinality;
+        if (std.mem.startsWith(u8, type_str, "Nested")) return .Nested;
         return error.UnsupportedType;
     }
 
@@ -71,6 +75,13 @@ pub const ClickHouseType = enum {
             else => false,
         };
     }
+
+    pub fn isComplex(self: ClickHouseType) bool {
+        return switch (self) {
+            .Array, .Nullable, .Map, .Tuple, .LowCardinality, .Nested => true,
+            else => false,
+        };
+    }
 };
 
 pub const TypeInfo = struct {
@@ -84,10 +95,17 @@ pub const TypeInfo = struct {
     tuple_types: ?[]const TypeInfo = null,
     map_key_type: ?*const TypeInfo = null,
     map_value_type: ?*const TypeInfo = null,
+    low_cardinality_type: ?*const TypeInfo = null,
+    nested_types: ?[]const NestedField = null,
 
     pub const EnumValue = struct {
         name: []const u8,
         value: i16,
+    };
+
+    pub const NestedField = struct {
+        name: []const u8,
+        type_info: TypeInfo,
     };
 
     pub fn parse(allocator: std.mem.Allocator, type_str: []const u8) !TypeInfo {
@@ -116,15 +134,75 @@ pub const TypeInfo = struct {
             return inner_info;
         }
 
-        // Handle other complex types...
-        if (std.mem.startsWith(u8, type_str, "FixedString(")) {
-            result.base_type = .FixedString;
-            const len_str = type_str[11 .. type_str.len - 1];
-            result.fixed_string_length = try std.fmt.parseInt(u32, len_str, 10);
+        if (std.mem.startsWith(u8, type_str, "LowCardinality(")) {
+            const inner_type = type_str[14 .. type_str.len - 1];
+            var inner_info = try parse(allocator, inner_type);
+            result.base_type = .LowCardinality;
+            result.low_cardinality_type = try allocator.create(TypeInfo);
+            result.low_cardinality_type.?.* = inner_info;
+            return result;
+        }
+
+        if (std.mem.startsWith(u8, type_str, "Map(")) {
+            result.base_type = .Map;
+            const map_types = type_str[4 .. type_str.len - 1];
+            var it = std.mem.split(u8, map_types, ",");
+            const key_type_str = it.next() orelse return error.InvalidMapType;
+            const value_type_str = it.next() orelse return error.InvalidMapType;
+            
+            result.map_key_type = try allocator.create(TypeInfo);
+            result.map_value_type = try allocator.create(TypeInfo);
+            result.map_key_type.?.* = try parse(allocator, std.mem.trim(u8, key_type_str, " "));
+            result.map_value_type.?.* = try parse(allocator, std.mem.trim(u8, value_type_str, " "));
+            return result;
+        }
+
+        if (std.mem.startsWith(u8, type_str, "Nested(")) {
+            result.base_type = .Nested;
+            const nested_fields = type_str[7 .. type_str.len - 1];
+            var fields = std.ArrayList(NestedField).init(allocator);
+            defer fields.deinit();
+
+            var it = std.mem.split(u8, nested_fields, ",");
+            while (it.next()) |field| {
+                const trimmed = std.mem.trim(u8, field, " ");
+                var field_parts = std.mem.split(u8, trimmed, " ");
+                const field_name = field_parts.next() orelse return error.InvalidNestedType;
+                const field_type = field_parts.next() orelse return error.InvalidNestedType;
+                
+                try fields.append(.{
+                    .name = try allocator.dupe(u8, field_name),
+                    .type_info = try parse(allocator, field_type),
+                });
+            }
+
+            result.nested_types = try fields.toOwnedSlice();
             return result;
         }
 
         result.base_type = try ClickHouseType.fromStr(type_str);
         return result;
+    }
+
+    pub fn deinit(self: *TypeInfo, allocator: std.mem.Allocator) void {
+        if (self.map_key_type) |key_type| {
+            key_type.deinit(allocator);
+            allocator.destroy(key_type);
+        }
+        if (self.map_value_type) |value_type| {
+            value_type.deinit(allocator);
+            allocator.destroy(value_type);
+        }
+        if (self.low_cardinality_type) |lc_type| {
+            lc_type.deinit(allocator);
+            allocator.destroy(lc_type);
+        }
+        if (self.nested_types) |nested| {
+            for (nested) |*field| {
+                allocator.free(field.name);
+                field.type_info.deinit(allocator);
+            }
+            allocator.free(nested);
+        }
     }
 };
